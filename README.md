@@ -1,0 +1,1 @@
+insane small codebase ib-- this is the rust ib i always dreamed of. I got pagination working, replies working its awesome. im trying to get it working for mp4 mp3 gif jpg bmp  webp webm to turn it into a chess site, the very last thing to do it get file uploads working. 

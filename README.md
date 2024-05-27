@@ -1,5 +1,6 @@
 
-![Screenshot 2024-05-26 215337](https://github.com/ChessLogical/dream-/assets/169053333/d3c76f89-ccbc-41db-b3ad-8541646c3d8c)
+
+![Screenshot 2024-05-27 004040](https://github.com/ChessLogical/dream-/assets/169053333/011ec607-64f0-4d77-8836-5fad51d51515)
 
 
 

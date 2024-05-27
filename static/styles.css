@@ -22,11 +22,6 @@ textarea {
     padding: 10px;
 }
 
-input[type="file"] {
-    display: block;
-    margin-top: 10px;
-}
-
 input[type="submit"] {
     margin-top: 10px;
     padding: 10px 20px;
@@ -41,6 +36,10 @@ input[type="submit"]:hover {
     background-color: #0056b3;
 }
 
+input[type="file"] {
+    margin-top: 10px;
+}
+
 .post {
     background-color: #1e1e1e;
     padding: 10px;
@@ -49,16 +48,16 @@ input[type="submit"]:hover {
     position: relative;
 }
 
-.post-image {
-    max-width: 100%;
-    height: auto;
-    border-radius: 5px;
+.post-header {
+    display: flex;
+    justify-content: space-between;
+}
+
+.post-id {
+    font-weight: bold;
 }
 
 .reply-button {
-    position: absolute;
-    top: 10px;
-    right: 10px;
     background-color: #007bff;
     color: #ffffff;
     padding: 5px 10px;
@@ -106,4 +105,17 @@ input[type="submit"]:hover {
 
 .replies {
     margin-top: 20px;
+}
+
+.responsive-img {
+    width: auto;
+    max-width: 75px;
+    height: auto;
+    max-height: 75px;
+    display: block;
+    margin: 10px 0;
+}
+
+.post-content {
+    margin-top: 30px;
 }

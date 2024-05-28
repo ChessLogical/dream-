@@ -1,18 +1,40 @@
-
 use actix_files as fs;
 use actix_multipart::Multipart;
 use actix_web::{web, App, HttpResponse, HttpServer, Result};
 use futures_util::stream::StreamExt as _;
 use std::collections::HashMap;
+use std::fs::read_to_string;
+use std::hash::{Hash, Hasher};
 use std::io::Write;
+use std::sync::Mutex;
 use actix_web::web::Data;
 use rusqlite::{params, Connection, Result as SqlResult};
-use std::sync::Mutex;
 use rand::{distributions::Alphanumeric, Rng};
+use std::collections::hash_map::DefaultHasher;
 
 // Maximum file size (20 MB)
 const MAX_SIZE: usize = 20 * 1024 * 1024;
 const POSTS_PER_PAGE: usize = 30;
+
+fn render_template(path: &str, context: &HashMap<&str, String>) -> String {
+    let template = read_to_string(path).expect("Unable to read template file");
+    let mut rendered = template;
+    for (key, value) in context {
+        let placeholder = format!("{{{{{}}}}}", key);
+        rendered = rendered.replace(&placeholder, value);
+    }
+    rendered
+}
+
+fn generate_color_from_id(id: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    id.hash(&mut hasher);
+    let hash = hasher.finish();
+    let r = (hash & 0xFF) as u8;
+    let g = ((hash >> 8) & 0xFF) as u8;
+    let b = ((hash >> 16) & 0xFF) as u8;
+    format!("#{:02X}{:02X}{:02X}", r, g, b)
+}
 
 async fn save_file(mut payload: Multipart, conn: web::Data<Mutex<Connection>>) -> Result<HttpResponse> {
     let mut title = String::new();
@@ -80,7 +102,7 @@ async fn save_file(mut payload: Multipart, conn: web::Data<Mutex<Connection>>) -
         return Ok(HttpResponse::BadRequest().body("Title and message are mandatory."));
     }
 
-    if title.len() > 20 || message.len() > 40000 {
+    if title.len() > 30 || message.len() > 50000 {
         return Ok(HttpResponse::BadRequest().body("Title or message is too long."));
     }
 
@@ -95,6 +117,13 @@ async fn save_file(mut payload: Multipart, conn: web::Data<Mutex<Connection>>) -
         "INSERT INTO files (post_id, parent_id, title, message, file_path) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![post_id, parent_id, title, message, file_path],
     ).unwrap();
+
+    if parent_id != 0 {
+        conn.execute(
+            "UPDATE files SET last_reply_at = CURRENT_TIMESTAMP WHERE id = ?1 OR parent_id = ?1",
+            params![parent_id],
+        ).unwrap();
+    }
 
     if parent_id == 0 {
         Ok(HttpResponse::SeeOther().append_header(("Location", "/")).finish())
@@ -119,109 +148,38 @@ async fn view_post(conn: web::Data<Mutex<Connection>>, path: web::Path<i32>) -> 
         ))
     }).unwrap();
 
-    let mut body = String::new();
-
-    body.push_str("<html><head><title>View Post</title><style>");
-    body.push_str(r#"
-        body {
-            background-color: #121212;
-            color: #FFFFFF;
-            font-family: Arial, sans-serif;
-        }
-        .centered-form {
-            display: flex;
-            justify-content: center;
-            margin-bottom: 20px;
-        }
-        form {
-            display: flex;
-            flex-direction: column;
-            width: 300px;
-            margin-bottom: 20px;
-        }
-        input[type="text"] {
-            width: 50%;
-        }
-        textarea {
-            height: 150px;
-        }
-        .post {
-            border-bottom: 5px solid #333333;
-            padding: 10px 0;
-        }
-        img, video {
-            max-width: 200px;
-            max-height: 200px;
-            display: block;
-            margin-bottom: 10px;
-        }
-        .back-link {
-            display: block;
-            margin-bottom: 20px;
-            text-align: center;
-        }
-        .back-link button {
-            background-color: #007bff;
-            color: #ffffff;
-            padding: 10px;
-            border: none;
-            border-radius: 5px;
-            cursor: pointer;
-        }
-        .back-link button:hover {
-            background-color: #0056b3;
-        }
-        button {
-            background-color: #007bff;
-            color: #ffffff;
-            padding: 10px;
-            border: none;
-            border-radius: 5px;
-            cursor: pointer;
-        }
-        button:hover {
-            background-color: #0056b3;
-        }
-    "#);
-    body.push_str("</style></head><body>");
-    body.push_str(r#"<div class="back-link"><a href="/"><button>Return to Main Board</button></a></div>"#);
-    body.push_str(
-        &format!(r#"<div class="centered-form"><form action="/upload" method="post" enctype="multipart/form-data">
-            <input type="hidden" name="parent_id" value="{}">
-            <input type="text" name="title" maxlength="20" placeholder="Title" required><br>
-            <textarea name="message" maxlength="40000" placeholder="Message" required></textarea><br>
-            <input type="file" name="file"><br>
-            <button type="submit">Reply</button>
-        </form></div>"#, post_id),
-    );
-
+    let mut posts_html = String::new();
     let mut is_original_post = true;
     let mut reply_count = 1;
 
     for post in posts {
         let (_id, _post_id, _parent_id, title, message, file_path) = post.unwrap();
-        
-        body.push_str("<div class=\"post\">");
+        posts_html.push_str("<div class=\"post\">");
         if is_original_post {
-            body.push_str("<div class=\"post-id\">Original Post</div>");
+            posts_html.push_str("<div class=\"post-id\">Original Post</div>");
             is_original_post = false;
         } else {
-            body.push_str(&format!("<div class=\"post-id\">Reply {}</div>", reply_count));
+            posts_html.push_str(&format!("<div class=\"post-id\">Reply {}</div>", reply_count));
             reply_count += 1;
         }
-        body.push_str(&format!("<div class=\"post-title\">{}</div>", title));
+        posts_html.push_str(&format!("<div class=\"post-title\">{}</div>", title));
         if let Some(file_path) = file_path {
             if file_path.ends_with(".jpg") || file_path.ends_with(".jpeg") || file_path.ends_with(".png") || file_path.ends_with(".gif") || file_path.ends_with(".webp") {
-                body.push_str(&format!(r#"<img src="/static/{}"><br>"#, file_path.trim_start_matches("./static/")));
+                posts_html.push_str(&format!(r#"<img src="/static/{}"><br>"#, file_path.trim_start_matches("./static/")));
             } else if file_path.ends_with(".mp4") || file_path.ends_with(".mp3") || file_path.ends_with(".webm") {
-                body.push_str(&format!(r#"<video controls><source src="/static/{}"></video><br>"#, file_path.trim_start_matches("./static/")));
+                posts_html.push_str(&format!(r#"<video controls><source src="/static/{}"></video><br>"#, file_path.trim_start_matches("./static/")));
             }
         }
-        body.push_str(&format!("<div class=\"post-message\">{}</div>", message));
-        body.push_str("</div>");
+        posts_html.push_str(&format!("<div class=\"post-message\">{}</div>", message));
+        posts_html.push_str("</div>");
     }
 
-    body.push_str("</body></html>");
+    let context = HashMap::from([
+        ("PARENT_ID", post_id.to_string()),
+        ("POSTS", posts_html),
+    ]);
+
+    let body = render_template("templates/view_post.html", &context);
 
     Ok(HttpResponse::Ok().content_type("text/html").body(body))
 }
@@ -231,7 +189,7 @@ async fn index(conn: web::Data<Mutex<Connection>>, query: web::Query<HashMap<Str
     let page: usize = query.get("page").and_then(|p| p.parse().ok()).unwrap_or(1);
     let offset = (page - 1) * POSTS_PER_PAGE;
 
-    let mut stmt = conn.prepare("SELECT id, post_id, title, message, file_path FROM files WHERE parent_id = 0 ORDER BY id DESC LIMIT ?1 OFFSET ?2").unwrap();
+    let mut stmt = conn.prepare("SELECT id, post_id, title, message, file_path FROM files WHERE parent_id = 0 ORDER BY last_reply_at DESC LIMIT ?1 OFFSET ?2").unwrap();
     let posts = stmt.query_map(params![POSTS_PER_PAGE as i64, offset as i64], |row| {
         Ok((
             row.get::<_, i32>(0)?,
@@ -242,94 +200,7 @@ async fn index(conn: web::Data<Mutex<Connection>>, query: web::Query<HashMap<Str
         ))
     }).unwrap();
 
-    let mut body = String::new();
-
-    body.push_str("<html><head><title>File Upload</title><style>");
-    body.push_str(r#"
-        body {
-            background-color: #121212;
-            color: #FFFFFF;
-            font-family: Arial, sans-serif;
-        }
-        .centered-form {
-            display: flex;
-            justify-content: center;
-            margin-bottom: 20px;
-        }
-        form {
-            display: flex;
-            flex-direction: column;
-            width: 300px;
-        }
-        input[type="text"] {
-            width: 50%;
-        }
-        textarea {
-            height: 150px;
-        }
-        .post {
-            border-bottom: 5px solid #333333;
-            padding: 10px 0;
-            position: relative;
-        }
-        .reply-button {
-            position: absolute;
-            top: 10px;
-            right: 10px;
-            background-color: #007bff;
-            color: #ffffff;
-            padding: 5px 10px;
-            border-radius: 5px;
-            text-decoration: none;
-            cursor: pointer;
-        }
-        .reply-button:hover {
-            background-color: #0056b3;
-        }
-        img, video {
-            max-width: 200px;
-            max-height: 200px;
-            display: block;
-            margin-bottom: 10px;
-        }
-        .pagination {
-            text-align: center;
-            margin-top: 20px;
-        }
-        .pagination a {
-            color: #FFFFFF;
-            padding: 5px 10px;
-            text-decoration: none;
-            border: 1px solid #FFFFFF;
-            margin: 0 5px;
-        }
-        .pagination a:hover {
-            background-color: #444444;
-        }
-        button {
-            background-color: #007bff;
-            color: #ffffff;
-            padding: 10px;
-            border: none;
-            border-radius: 5px;
-            cursor: pointer;
-        }
-        button:hover {
-            background-color: #0056b3;
-        }
-    "#);
-    body.push_str("</style></head><body>");
-    body.push_str(r#"<div class="centered-form">"#);
-    body.push_str(
-        r#"<form action="/upload" method="post" enctype="multipart/form-data">
-            <input type="hidden" name="parent_id" value="0">
-            <input type="text" name="title" maxlength="20" placeholder="Title" required><br>
-            <textarea name="message" maxlength="40000" placeholder="Message" required></textarea><br>
-            <input type="file" name="file"><br>
-            <button type="submit">Upload</button>
-        </form>"#,
-    );
-    body.push_str(r#"</div>"#);
+    let mut posts_html = String::new();
 
     for post in posts {
         let (id, post_id, title, message, file_path) = post.unwrap();
@@ -340,31 +211,43 @@ async fn index(conn: web::Data<Mutex<Connection>>, query: web::Query<HashMap<Str
             |row| row.get(0),
         ).unwrap_or(0);
 
-        body.push_str("<div class=\"post\">");
-        body.push_str(&format!("<div class=\"post-id\">{}</div>", post_id));
-        body.push_str(&format!("<div class=\"post-title\">{}</div>", title));
+        let truncated_message = if message.len() > 2700 {
+            format!("{}... <a href=\"/post/{}\" class=\"view-full-post\">Click here to open full post</a>", &message[..2700], id)
+        } else {
+            message.clone()
+        };
+
+        let post_color = generate_color_from_id(&post_id);
+
+        posts_html.push_str("<div class=\"post\">");
+        posts_html.push_str(&format!("<div class=\"post-id-box\" style=\"background-color: {}\">{}</div>", post_color, post_id));
+        posts_html.push_str(&format!("<div class=\"post-title title-green\">{}</div>", title));
         if let Some(file_path) = file_path {
             if file_path.ends_with(".jpg") || file_path.ends_with(".jpeg") || file_path.ends_with(".png") || file_path.ends_with(".gif") || file_path.ends_with(".webp") {
-                body.push_str(&format!(r#"<img src="/static/{}"><br>"#, file_path.trim_start_matches("./static/")));
+                posts_html.push_str(&format!(r#"<img src="/static/{}"><br>"#, file_path.trim_start_matches("./static/")));
             } else if file_path.ends_with(".mp4") || file_path.ends_with(".mp3") || file_path.ends_with(".webm") {
-                body.push_str(&format!(r#"<video controls><source src="/static/{}"></video><br>"#, file_path.trim_start_matches("./static/")));
+                posts_html.push_str(&format!(r#"<video controls><source src="/static/{}"></video><br>"#, file_path.trim_start_matches("./static/")));
             }
         }
-        body.push_str(&format!("<div class=\"post-message\">{}</div>", message));
-        body.push_str(&format!("<a class=\"reply-button\" href=\"/post/{}\">Reply ({})</a>", id, reply_count));
-        body.push_str("</div>");
+        posts_html.push_str(&format!("<div class=\"post-message\">{}</div>", truncated_message));
+        posts_html.push_str(&format!("<a class=\"reply-button\" href=\"/post/{}\">Reply ({})</a>", id, reply_count));
+        posts_html.push_str("</div>");
     }
 
     let next_page = page + 1;
     let prev_page = if page > 1 { page - 1 } else { 1 };
-    body.push_str("<div class=\"pagination\">");
+    let mut pagination_html = String::new();
     if page > 1 {
-        body.push_str(&format!(r#"<a href="/?page={}">Previous</a>"#, prev_page));
+        pagination_html.push_str(&format!(r#"<a href="/?page={}">Previous</a>"#, prev_page));
     }
-    body.push_str(&format!(r#"<a href="/?page={}">Next</a>"#, next_page));
-    body.push_str("</div>");
+    pagination_html.push_str(&format!(r#"<a href="/?page={}">Next</a>"#, next_page));
 
-    body.push_str("</body></html>");
+    let context = HashMap::from([
+        ("POSTS", posts_html),
+        ("PAGINATION", pagination_html),
+    ]);
+
+    let body = render_template("templates/index.html", &context);
 
     Ok(HttpResponse::Ok().content_type("text/html").body(body))
 }
@@ -378,7 +261,8 @@ fn initialize_db() -> SqlResult<Connection> {
             parent_id INTEGER,
             title TEXT NOT NULL,
             message TEXT NOT NULL,
-            file_path TEXT
+            file_path TEXT,
+            last_reply_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )",
         [],
     )?;

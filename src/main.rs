@@ -1,354 +1,414 @@
-#[macro_use] extern crate rocket;
 
-use rocket::form::Form;
-use rocket::fs::{relative, FileServer, TempFile};
-use rocket::http::ContentType;
-use rocket::response::{content::RawHtml, Redirect};
-use rocket::serde::{Serialize, Deserialize};
-use rusqlite::{params, Connection};
+use actix_files as fs;
+use actix_multipart::Multipart;
+use actix_web::{web, App, HttpResponse, HttpServer, Result};
+use futures_util::stream::StreamExt as _;
+use std::collections::HashMap;
+use std::io::Write;
+use actix_web::web::Data;
+use rusqlite::{params, Connection, Result as SqlResult};
+use std::sync::Mutex;
 use rand::{distributions::Alphanumeric, Rng};
-use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
-use rocket::fairing::AdHoc;
-use rocket::Config;
 
-#[derive(Debug, Serialize, Deserialize, FromForm)]
-struct Post {
-    id: Option<i32>,
-    content: String,
-    parent_id: Option<i32>,
-    reply_id: Option<i32>,
-    display_id: Option<String>,
-    timestamp: Option<u64>,
-    image_url: Option<String>,
-}
+// Maximum file size (20 MB)
+const MAX_SIZE: usize = 20 * 1024 * 1024;
+const POSTS_PER_PAGE: usize = 30;
 
-#[derive(FromForm)]
-struct PostForm<'r> {
-    content: &'r str,
-    image: Option<TempFile<'r>>,
-}
+async fn save_file(mut payload: Multipart, conn: web::Data<Mutex<Connection>>) -> Result<HttpResponse> {
+    let mut title = String::new();
+    let mut message = String::new();
+    let mut file_path = None;
+    let mut parent_id: i32 = 0;
 
-fn generate_display_id() -> String {
-    rand::thread_rng()
+    while let Some(item) = payload.next().await {
+        let mut field = item?;
+        let content_disposition = field.content_disposition().clone();
+        let name = content_disposition.get_name().unwrap_or("").to_string();
+
+        match name.as_str() {
+            "title" => {
+                while let Some(chunk) = field.next().await {
+                    let data = chunk?;
+                    title.push_str(&String::from_utf8_lossy(&data));
+                }
+            },
+            "message" => {
+                while let Some(chunk) = field.next().await {
+                    let data = chunk?;
+                    message.push_str(&String::from_utf8_lossy(&data));
+                }
+            },
+            "file" => {
+                if let Some(filename) = content_disposition.get_filename() {
+                    let file_extension = filename.split('.').last().unwrap_or("");
+                    let sanitized_filename = sanitize_filename::sanitize(&filename);
+                    let unique_id: String = rand::thread_rng()
+                        .sample_iter(&Alphanumeric)
+                        .take(6)
+                        .map(char::from)
+                        .collect();
+                    let unique_filename = format!("{}-{}", unique_id, sanitized_filename);
+
+                    let valid_image_extensions = ["jpg", "jpeg", "png", "gif", "webp"];
+                    let valid_video_extensions = ["mp4", "mp3", "webm"];
+
+                    if valid_image_extensions.contains(&file_extension) || valid_video_extensions.contains(&file_extension) {
+                        let file_path_string = format!("./static/{}", unique_filename);
+                        let file_path_clone = file_path_string.clone();
+                        let mut f = web::block(move || std::fs::File::create(file_path_clone)).await??;
+
+                        while let Some(chunk) = field.next().await {
+                            let data = chunk?;
+                            f = web::block(move || f.write_all(&data).map(|_| f)).await??;
+                        }
+
+                        file_path = Some(file_path_string);
+                    }
+                }
+            },
+            "parent_id" => {
+                while let Some(chunk) = field.next().await {
+                    let data = chunk?;
+                    parent_id = String::from_utf8_lossy(&data).trim().parse().unwrap_or(0);
+                }
+            },
+            _ => {},
+        }
+    }
+
+    if title.trim().is_empty() || message.trim().is_empty() {
+        return Ok(HttpResponse::BadRequest().body("Title and message are mandatory."));
+    }
+
+    if title.len() > 20 || message.len() > 40000 {
+        return Ok(HttpResponse::BadRequest().body("Title or message is too long."));
+    }
+
+    let post_id: String = rand::thread_rng()
         .sample_iter(&Alphanumeric)
-        .take(5)
+        .take(6)
         .map(char::from)
-        .collect()
-}
+        .collect();
 
-fn current_timestamp() -> u64 {
-    let start = SystemTime::now();
-    let since_the_epoch = start.duration_since(UNIX_EPOCH).expect("Time went backwards");
-    since_the_epoch.as_secs()
-}
+    let conn = conn.lock().unwrap();
+    conn.execute(
+        "INSERT INTO files (post_id, parent_id, title, message, file_path) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![post_id, parent_id, title, message, file_path],
+    ).unwrap();
 
-fn get_extension(content_type: &ContentType) -> Option<&str> {
-    if content_type == &ContentType::JPEG {
-        Some("jpg")
-    } else if content_type == &ContentType::PNG {
-        Some("png")
-    } else if content_type == &ContentType::GIF {
-        Some("gif")
-    } else if content_type == &ContentType::WEBP {
-        Some("webp")
+    if parent_id == 0 {
+        Ok(HttpResponse::SeeOther().append_header(("Location", "/")).finish())
     } else {
-        None
+        Ok(HttpResponse::SeeOther().append_header(("Location", format!("/post/{}", parent_id))).finish())
     }
 }
 
-#[post("/submit", data = "<post_form>")]
-async fn submit(mut post_form: Form<PostForm<'_>>) -> Result<Redirect, String> {
-    let content = post_form.content.to_string();
-    let display_id = generate_display_id();
-    let timestamp = current_timestamp();
-    let mut image_url = None;
+async fn view_post(conn: web::Data<Mutex<Connection>>, path: web::Path<i32>) -> Result<HttpResponse> {
+    let conn = conn.lock().unwrap();
+    let post_id = path.into_inner();
 
-    if let Some(image) = &mut post_form.image {
-        if let Some(ext) = image.content_type().and_then(get_extension) {
-            let filename = format!("{}.{}", display_id, ext);
-            let filepath = Path::new("static/uploads").join(&filename);
-            match image.persist_to(filepath).await {
-                Ok(_) => {
-                    image_url = Some(format!("/static/uploads/{}", filename));
-                }
-                Err(e) => {
-                    let error_message = format!("Failed to save image: {}", e);
-                    eprintln!("{}", error_message);
-                    return Err(error_message);
-                }
+    let mut stmt = conn.prepare("SELECT id, post_id, parent_id, title, message, file_path FROM files WHERE id = ?1 OR parent_id = ?1 ORDER BY id ASC").unwrap();
+    let posts = stmt.query_map(params![post_id], |row| {
+        Ok((
+            row.get::<_, i32>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i32>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, Option<String>>(5)?,
+        ))
+    }).unwrap();
+
+    let mut body = String::new();
+
+    body.push_str("<html><head><title>View Post</title><style>");
+    body.push_str(r#"
+        body {
+            background-color: #121212;
+            color: #FFFFFF;
+            font-family: Arial, sans-serif;
+        }
+        .centered-form {
+            display: flex;
+            justify-content: center;
+            margin-bottom: 20px;
+        }
+        form {
+            display: flex;
+            flex-direction: column;
+            width: 300px;
+            margin-bottom: 20px;
+        }
+        input[type="text"] {
+            width: 50%;
+        }
+        textarea {
+            height: 150px;
+        }
+        .post {
+            border-bottom: 5px solid #333333;
+            padding: 10px 0;
+        }
+        img, video {
+            max-width: 200px;
+            max-height: 200px;
+            display: block;
+            margin-bottom: 10px;
+        }
+        .back-link {
+            display: block;
+            margin-bottom: 20px;
+            text-align: center;
+        }
+        .back-link button {
+            background-color: #007bff;
+            color: #ffffff;
+            padding: 10px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+        .back-link button:hover {
+            background-color: #0056b3;
+        }
+        button {
+            background-color: #007bff;
+            color: #ffffff;
+            padding: 10px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+    "#);
+    body.push_str("</style></head><body>");
+    body.push_str(r#"<div class="back-link"><a href="/"><button>Return to Main Board</button></a></div>"#);
+    body.push_str(
+        &format!(r#"<div class="centered-form"><form action="/upload" method="post" enctype="multipart/form-data">
+            <input type="hidden" name="parent_id" value="{}">
+            <input type="text" name="title" maxlength="20" placeholder="Title" required><br>
+            <textarea name="message" maxlength="40000" placeholder="Message" required></textarea><br>
+            <input type="file" name="file"><br>
+            <button type="submit">Reply</button>
+        </form></div>"#, post_id),
+    );
+
+    let mut is_original_post = true;
+    let mut reply_count = 1;
+
+    for post in posts {
+        let (_id, _post_id, _parent_id, title, message, file_path) = post.unwrap();
+        
+        body.push_str("<div class=\"post\">");
+        if is_original_post {
+            body.push_str("<div class=\"post-id\">Original Post</div>");
+            is_original_post = false;
+        } else {
+            body.push_str(&format!("<div class=\"post-id\">Reply {}</div>", reply_count));
+            reply_count += 1;
+        }
+        body.push_str(&format!("<div class=\"post-title\">{}</div>", title));
+        if let Some(file_path) = file_path {
+            if file_path.ends_with(".jpg") || file_path.ends_with(".jpeg") || file_path.ends_with(".png") || file_path.ends_with(".gif") || file_path.ends_with(".webp") {
+                body.push_str(&format!(r#"<img src="/static/{}"><br>"#, file_path.trim_start_matches("./static/")));
+            } else if file_path.ends_with(".mp4") || file_path.ends_with(".mp3") || file_path.ends_with(".webm") {
+                body.push_str(&format!(r#"<video controls><source src="/static/{}"></video><br>"#, file_path.trim_start_matches("./static/")));
             }
         }
+        body.push_str(&format!("<div class=\"post-message\">{}</div>", message));
+        body.push_str("</div>");
     }
 
-    let conn = match Connection::open("posts.db") {
-        Ok(conn) => conn,
-        Err(e) => {
-            let error_message = format!("Failed to open database connection: {}", e);
-            eprintln!("{}", error_message);
-            return Err(error_message);
-        }
-    };
+    body.push_str("</body></html>");
 
-    if let Err(e) = conn.execute(
-        "INSERT INTO posts (content, parent_id, reply_id, display_id, timestamp, image_url) VALUES (?1, NULL, NULL, ?2, ?3, ?4)",
-        params![content, display_id, timestamp, image_url],
-    ) {
-        let error_message = format!("Failed to insert post into database: {}", e);
-        eprintln!("{}", error_message);
-        return Err(error_message);
-    }
-
-    Ok(Redirect::to("/"))
+    Ok(HttpResponse::Ok().content_type("text/html").body(body))
 }
 
-#[post("/submit_reply/<parent_id>", data = "<post_form>")]
-async fn submit_reply(parent_id: i32, post_form: Form<PostForm<'_>>) -> Result<Redirect, String> {
-    let content = post_form.content.to_string();
-    let timestamp = current_timestamp();
+async fn index(conn: web::Data<Mutex<Connection>>, query: web::Query<HashMap<String, String>>) -> Result<HttpResponse> {
+    let conn = conn.lock().unwrap();
+    let page: usize = query.get("page").and_then(|p| p.parse().ok()).unwrap_or(1);
+    let offset = (page - 1) * POSTS_PER_PAGE;
 
-    let conn = match Connection::open("posts.db") {
-        Ok(conn) => conn,
-        Err(e) => {
-            let error_message = format!("Failed to open database connection: {}", e);
-            eprintln!("{}", error_message);
-            return Err(error_message);
-        }
-    };
-
-    let reply_id: i32 = match conn.query_row(
-        "SELECT COALESCE(MAX(reply_id), 0) + 1 FROM posts WHERE parent_id = ?1",
-        params![parent_id],
-        |row| row.get(0)
-    ) {
-        Ok(id) => id,
-        Err(e) => {
-            let error_message = format!("Failed to get next reply_id: {}", e);
-            eprintln!("{}", error_message);
-            return Err(error_message);
-        }
-    };
-
-    if let Err(e) = conn.execute(
-        "INSERT INTO posts (content, parent_id, reply_id, display_id, timestamp) VALUES (?1, ?2, ?3, NULL, ?4)",
-        params![content, parent_id, reply_id, timestamp],
-    ) {
-        let error_message = format!("Failed to insert reply into database: {}", e);
-        eprintln!("{}", error_message);
-        return Err(error_message);
-    }
-
-    // Update the timestamp of the original post to bring it to the top
-    if let Err(e) = conn.execute(
-        "UPDATE posts SET timestamp = ?1 WHERE id = ?2",
-        params![timestamp, parent_id],
-    ) {
-        let error_message = format!("Failed to update post timestamp: {}", e);
-        eprintln!("{}", error_message);
-        return Err(error_message);
-    }
-
-    Ok(Redirect::to(format!("/reply/{}", parent_id)))
-}
-
-#[get("/?<page>")]
-fn index(page: Option<usize>) -> RawHtml<String> {
-    let page = page.unwrap_or(1);
-    let posts_per_page = 10;
-    let offset = (page - 1) * posts_per_page;
-
-    let conn = Connection::open("posts.db").unwrap();
-    let mut stmt = conn.prepare("SELECT id, content, display_id, image_url FROM posts WHERE parent_id IS NULL ORDER BY timestamp DESC LIMIT ?1 OFFSET ?2").unwrap();
-    let post_iter = stmt.query_map(params![posts_per_page as i64, offset as i64], |row| {
-        Ok(Post {
-            id: row.get(0)?,
-            content: row.get(1)?,
-            parent_id: None,
-            reply_id: None,
-            display_id: row.get(2)?,
-            timestamp: None,
-            image_url: row.get(3)?,
-        })
+    let mut stmt = conn.prepare("SELECT id, post_id, title, message, file_path FROM files WHERE parent_id = 0 ORDER BY id DESC LIMIT ?1 OFFSET ?2").unwrap();
+    let posts = stmt.query_map(params![POSTS_PER_PAGE as i64, offset as i64], |row| {
+        Ok((
+            row.get::<_, i32>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, Option<String>>(4)?,
+        ))
     }).unwrap();
 
-    let mut posts = String::new();
-    for post in post_iter {
-        let post = post.unwrap();
+    let mut body = String::new();
+
+    body.push_str("<html><head><title>File Upload</title><style>");
+    body.push_str(r#"
+        body {
+            background-color: #121212;
+            color: #FFFFFF;
+            font-family: Arial, sans-serif;
+        }
+        .centered-form {
+            display: flex;
+            justify-content: center;
+            margin-bottom: 20px;
+        }
+        form {
+            display: flex;
+            flex-direction: column;
+            width: 300px;
+        }
+        input[type="text"] {
+            width: 50%;
+        }
+        textarea {
+            height: 150px;
+        }
+        .post {
+            border-bottom: 5px solid #333333;
+            padding: 10px 0;
+            position: relative;
+        }
+        .reply-button {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background-color: #007bff;
+            color: #ffffff;
+            padding: 5px 10px;
+            border-radius: 5px;
+            text-decoration: none;
+            cursor: pointer;
+        }
+        .reply-button:hover {
+            background-color: #0056b3;
+        }
+        img, video {
+            max-width: 200px;
+            max-height: 200px;
+            display: block;
+            margin-bottom: 10px;
+        }
+        .pagination {
+            text-align: center;
+            margin-top: 20px;
+        }
+        .pagination a {
+            color: #FFFFFF;
+            padding: 5px 10px;
+            text-decoration: none;
+            border: 1px solid #FFFFFF;
+            margin: 0 5px;
+        }
+        .pagination a:hover {
+            background-color: #444444;
+        }
+        button {
+            background-color: #007bff;
+            color: #ffffff;
+            padding: 10px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+    "#);
+    body.push_str("</style></head><body>");
+    body.push_str(r#"<div class="centered-form">"#);
+    body.push_str(
+        r#"<form action="/upload" method="post" enctype="multipart/form-data">
+            <input type="hidden" name="parent_id" value="0">
+            <input type="text" name="title" maxlength="20" placeholder="Title" required><br>
+            <textarea name="message" maxlength="40000" placeholder="Message" required></textarea><br>
+            <input type="file" name="file"><br>
+            <button type="submit">Upload</button>
+        </form>"#,
+    );
+    body.push_str(r#"</div>"#);
+
+    for post in posts {
+        let (id, post_id, title, message, file_path) = post.unwrap();
+
         let reply_count: i32 = conn.query_row(
-            "SELECT COUNT(*) FROM posts WHERE parent_id = ?1",
-            params![post.id],
-            |row| row.get(0)
-        ).unwrap();
-        posts.push_str(&format!(
-            "<div class='post'>
-                <div class='post-header'>
-                    <span class='post-id'>{}</span>
-                    <a href='/reply/{}' class='reply-button'>Reply ({})</a>
-                </div>
-                {}
-                <div class='post-content'>
-                    {}
-                </div>
-            </div>",
-            post.display_id.as_ref().unwrap(), post.id.unwrap(), reply_count,
-            if let Some(image_url) = post.image_url {
-                format!("<img src='{}' alt='Image' class='responsive-img'/>", image_url)
-            } else {
-                String::new()
-            },
-            post.content.replace("\n", "<br/>")
-        ));
+            "SELECT COUNT(*) FROM files WHERE parent_id = ?1",
+            params![id],
+            |row| row.get(0),
+        ).unwrap_or(0);
+
+        body.push_str("<div class=\"post\">");
+        body.push_str(&format!("<div class=\"post-id\">{}</div>", post_id));
+        body.push_str(&format!("<div class=\"post-title\">{}</div>", title));
+        if let Some(file_path) = file_path {
+            if file_path.ends_with(".jpg") || file_path.ends_with(".jpeg") || file_path.ends_with(".png") || file_path.ends_with(".gif") || file_path.ends_with(".webp") {
+                body.push_str(&format!(r#"<img src="/static/{}"><br>"#, file_path.trim_start_matches("./static/")));
+            } else if file_path.ends_with(".mp4") || file_path.ends_with(".mp3") || file_path.ends_with(".webm") {
+                body.push_str(&format!(r#"<video controls><source src="/static/{}"></video><br>"#, file_path.trim_start_matches("./static/")));
+            }
+        }
+        body.push_str(&format!("<div class=\"post-message\">{}</div>", message));
+        body.push_str(&format!("<a class=\"reply-button\" href=\"/post/{}\">Reply ({})</a>", id, reply_count));
+        body.push_str("</div>");
     }
 
-    let mut pagination = String::new();
+    let next_page = page + 1;
+    let prev_page = if page > 1 { page - 1 } else { 1 };
+    body.push_str("<div class=\"pagination\">");
     if page > 1 {
-        pagination.push_str(&format!(r#"<a href="/?page={}" class="button">Previous</a>"#, page - 1));
+        body.push_str(&format!(r#"<a href="/?page={}">Previous</a>"#, prev_page));
     }
-    pagination.push_str(&format!(r#"<a href="/?page={}" class="button">Next</a>"#, page + 1));
+    body.push_str(&format!(r#"<a href="/?page={}">Next</a>"#, next_page));
+    body.push_str("</div>");
 
-    RawHtml(format!(
-        r#"
-        <html>
-            <head>
-                <link rel="stylesheet" type="text/css" href="/static/styles.css">
-            </head>
-            <body>
-                <div class="container">
-                    <form action="/submit" method="post" enctype="multipart/form-data">
-                        <textarea name="content" required></textarea><br/>
-                        <input type="file" name="image" accept="image/jpeg, image/png, image/gif, image/webp"><br/>
-                        <input type="submit" value="Post" class="button">
-                    </form>
-                    <div class="posts">{}</div>
-                    <div class="pagination">{}</div>
-                </div>
-            </body>
-        </html>
-        "#,
-        posts,
-        pagination
-    ))
+    body.push_str("</body></html>");
+
+    Ok(HttpResponse::Ok().content_type("text/html").body(body))
 }
 
-#[get("/reply/<post_id>")]
-fn reply(post_id: i32) -> RawHtml<String> {
-    let conn = Connection::open("posts.db").unwrap();
-    
-    let mut stmt = conn.prepare("SELECT id, content, display_id, image_url FROM posts WHERE id = ?1").unwrap();
-    let post = stmt.query_row(params![post_id], |row| {
-        Ok(Post {
-            id: row.get(0)?,
-            content: row.get(1)?,
-            parent_id: None,
-            reply_id: None,
-            display_id: row.get(2)?,
-            timestamp: None,
-            image_url: row.get(3)?,
-        })
-    }).unwrap();
-
-    let mut stmt = conn.prepare("SELECT id, content, reply_id FROM posts WHERE parent_id = ?1 ORDER BY reply_id DESC").unwrap();
-    let reply_iter = stmt.query_map(params![post_id], |row| {
-        Ok(Post {
-            id: row.get(0)?,
-            content: row.get(1)?,
-            parent_id: Some(post_id),
-            reply_id: row.get(2)?,
-            display_id: None,
-            timestamp: None,
-            image_url: None,
-        })
-    }).unwrap();
-
-    let mut replies = String::new();
-    for reply in reply_iter {
-        let reply = reply.unwrap();
-        replies.push_str(&format!(
-            "<div class='post'>
-                <div class='post-header'>
-                    <span class='post-id'>Reply {}</span>
-                </div>
-                <div class='post-content'>
-                    {}
-                </div>
-            </div>",
-            reply.reply_id.unwrap(),
-            reply.content.replace("\n", "<br/>")
-        ));
-    }
-
-    RawHtml(format!(
-        r#"
-        <html>
-            <head>
-                <link rel="stylesheet" type="text/css" href="/static/styles.css">
-            </head>
-            <body>
-                <div class="container">
-                    <a href="/" class="home-button">Home</a>
-                    <form action="/submit_reply/{}" method="post">
-                        <textarea name="content" required></textarea><br/>
-                        <input type="submit" value="Reply" class="button">
-                    </form>
-                    <div class="post">
-                        <div class='post-header'>
-                            <span class='post-id'>{}</span>
-                        </div>
-                        {}
-                        <div class='post-content'>
-                            {}
-                        </div>
-                    </div>
-                    <div class="replies">{}</div>
-                </div>
-            </body>
-        </html>
-        "#,
-        post_id,
-        post.display_id.unwrap(),
-        if let Some(image_url) = post.image_url {
-            format!("<img src='{}' alt='Image' class='responsive-img'/>", image_url)
-        } else {
-            String::new()
-        },
-        post.content.replace("\n", "<br/>"),
-        replies
-    ))
-}
-
-fn initialize_database() {
-    let conn = Connection::open("posts.db").unwrap();
+fn initialize_db() -> SqlResult<Connection> {
+    let conn = Connection::open("my_database.db")?;
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS posts (
-            id INTEGER PRIMARY KEY,
-            content TEXT NOT NULL,
+        "CREATE TABLE IF NOT EXISTS files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            post_id TEXT NOT NULL,
             parent_id INTEGER,
-            reply_id INTEGER,
-            display_id TEXT,
-            timestamp INTEGER,
-            image_url TEXT
+            title TEXT NOT NULL,
+            message TEXT NOT NULL,
+            file_path TEXT
         )",
         [],
-    ).unwrap();
+    )?;
+    Ok(conn)
 }
 
-#[catch(413)]
-fn payload_too_large() -> &'static str {
-    "Payload too large! The file you are trying to upload exceeds the server's limit."
-}
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    let conn = initialize_db().unwrap();
+    let conn_data = Data::new(Mutex::new(conn));
 
-#[launch]
-fn rocket() -> _ {
-    initialize_database();
-    rocket::build()
-        .mount("/", routes![index, submit, submit_reply, reply])
-        .mount("/static", FileServer::from(relative!("static")))
-        .register("/", catchers![payload_too_large])
-        .attach(AdHoc::on_liftoff("Config Logger", |_| {
-            Box::pin(async move {
-                let config = Config::figment();
-                println!("Config: {:?}", config);
-            })
-        }))
+    HttpServer::new(move || {
+        App::new()
+            .app_data(conn_data.clone())
+            .app_data(Data::new(web::JsonConfig::default().limit(MAX_SIZE)))
+            .service(
+                web::resource("/")
+                    .route(web::get().to(index))
+            )
+            .service(
+                web::resource("/upload")
+                    .route(web::post().to(save_file))
+            )
+            .service(
+                web::resource("/post/{id}")
+                    .route(web::get().to(view_post))
+            )
+            .service(fs::Files::new("/static", "./static").show_files_listing())
+    })
+    .bind("0.0.0.0:8080")?
+    .run()
+    .await
 }
-
